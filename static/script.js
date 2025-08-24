@@ -5,7 +5,6 @@ const deviceSelect = document.getElementById('deviceSelect');
 const btnStart = document.getElementById('btnStart');
 const btnCapture = document.getElementById('btnCapture');
 const errorsEl = document.getElementById('errors');
-
 const titleLine = document.getElementById('titleLine');
 const detailLine = document.getElementById('detailLine');
 const latlonLine = document.getElementById('latlonLine');

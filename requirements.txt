@@ -6,3 +6,4 @@ requests>=2.31.0
 cryptography>=40.0
 qrcode>=7.4
 opencv-python>=4.9.0.80
+gunicorn

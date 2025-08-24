@@ -1,17 +1,15 @@
 # app.py
 """
-Geo-Tagged Photo Taker (optimized capture)
-- Keeps all features: signing, QR, EXIF, strip overlay, DB fallback, verification.
-- Optimizations:
-  * Geocode caching (SQLite + in-memory)
-  * Reverse-geocode runs in background thread while CPU work (pHash) runs concurrently
-  * Faster QR compression (zlib level reduced) and smaller QR box_size/border
-  * pHash resize reduced (32->16) to speed DCT
-  * requests.Session reuse, font caching
+Geo-Tagged Photo App (robust across social sharing)
+- Strong QR (ERROR_CORRECT_H, larger modules, better decoder)
+- Survivable verification without EXIF/QR via multi-hash fallback (pHash/aHash/dHash, full + top region)
+- Returns full geotag details on valid results
+- Detects label tampering by comparing reconstructed strip to the bottom region
+- Reliable downloads in production (/view vs /download)
 """
 from flask import Flask, render_template, request, jsonify, url_for, send_from_directory
 from datetime import datetime, timezone, timedelta
-import io, os, requests, base64, json, hashlib, zlib, sqlite3, threading, time
+import io, os, requests, base64, json, hashlib, zlib, sqlite3, threading
 from PIL import Image, ImageDraw, ImageFont
 import piexif
 from piexif.helper import UserComment
@@ -20,7 +18,7 @@ from openlocationcode import openlocationcode as olc
 
 # QR
 import qrcode
-from qrcode.constants import ERROR_CORRECT_M  # moderate error correction for smaller QR & speed
+from qrcode.constants import ERROR_CORRECT_H  # <-- robust again
 
 # OpenCV + numpy
 import cv2
@@ -30,6 +28,8 @@ import numpy as np
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding as asym_padding
 from cryptography.exceptions import InvalidSignature
+
+from werkzeug.utils import secure_filename
 
 # ------------------ Config ------------------
 app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -45,12 +45,11 @@ os.makedirs(DB_DIR, exist_ok=True)
 os.makedirs(KEY_DIR, exist_ok=True)
 
 NOMINATIM_EMAIL = os.environ.get("NOMINATIM_EMAIL", "youremail@example.com")
-
-# Single requests session (reuses connections)
 SESSION = requests.Session()
 
-# ------------------ Key handling (auto: prefer ECDSA P-256) ------------------
+# ------------------ Key handling ------------------
 def generate_and_store_keys():
+    # Generate ECDSA P-256 by default; supports RSA too if keys already exist
     priv = ec.generate_private_key(ec.SECP256R1())
     priv_pem = priv.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -86,9 +85,11 @@ def public_key_route():
                                           format=serialization.PublicFormat.SubjectPublicKeyInfo)
         with open(PUBLIC_KEY_FILE, "wb") as f:
             f.write(pub_pem)
-    return send_from_directory(os.path.dirname(PUBLIC_KEY_FILE), os.path.basename(PUBLIC_KEY_FILE), as_attachment=True)
+    return send_from_directory(os.path.dirname(PUBLIC_KEY_FILE),
+                               os.path.basename(PUBLIC_KEY_FILE),
+                               as_attachment=True)
 
-# ------------------ DB (sqlite) with geocode cache + migration ------------------
+# ------------------ DB + schema migration ------------------
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -113,42 +114,56 @@ def init_db():
         ts TEXT
       )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_geo_latlon ON geocode_cache(lat_r, lon_r)")
     con.commit()
+
+    # schema migration for new hash columns
+    cur.execute("PRAGMA table_info(images)")
+    cols = {row[1] for row in cur.fetchall()}
+    alters = []
+    if "photo_phash_top" not in cols:
+        alters.append("ALTER TABLE images ADD COLUMN photo_phash_top TEXT")
+    if "ahash_full" not in cols:
+        alters.append("ALTER TABLE images ADD COLUMN ahash_full TEXT")
+    if "ahash_top" not in cols:
+        alters.append("ALTER TABLE images ADD COLUMN ahash_top TEXT")
+    if "dhash_full" not in cols:
+        alters.append("ALTER TABLE images ADD COLUMN dhash_full TEXT")
+    if "dhash_top" not in cols:
+        alters.append("ALTER TABLE images ADD COLUMN dhash_top TEXT")
+    for stmt in alters:
+        cur.execute(stmt)
+    if alters:
+        con.commit()
+    cur.close()
     con.close()
 
 init_db()
 
-# in-memory LRU-ish simple cache for small speed boost
+# --------------- in-memory geocode cache ----------------
 _GEOCACHE_MEM = {}
 _GEOCACHE_MEM_LOCK = threading.Lock()
-_GEOCACHE_PRECISION = 5  # number of decimals to round for caching (≈1.1m at equator)
+_GEOCACHE_PRECISION = 5
 
 def _round_coords(lat, lon, precision=_GEOCACHE_PRECISION):
     return round(float(lat), precision), round(float(lon), precision)
 
 def get_geocode_cache_db(lat, lon, precision=_GEOCACHE_PRECISION):
     lat_r, lon_r = _round_coords(lat, lon, precision)
-    # check in-memory first
     key = (lat_r, lon_r)
     with _GEOCACHE_MEM_LOCK:
         if key in _GEOCACHE_MEM:
             return _GEOCACHE_MEM[key]
-    # check SQLite
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("SELECT display, address_json FROM geocode_cache WHERE lat_r=? AND lon_r=? LIMIT 1", (lat_r, lon_r))
     row = cur.fetchone()
     con.close()
     if row:
-        try:
-            display = row[0]
-            addr = json.loads(row[1]) if row[1] else {}
-            with _GEOCACHE_MEM_LOCK:
-                _GEOCACHE_MEM[key] = (display, addr)
-            return display, addr
-        except Exception:
-            return None
+        display = row[0]
+        addr = json.loads(row[1]) if row[1] else {}
+        with _GEOCACHE_MEM_LOCK:
+            _GEOCACHE_MEM[key] = (display, addr)
+        return display, addr
     return None
 
 def set_geocode_cache_db(lat, lon, display, address, precision=_GEOCACHE_PRECISION):
@@ -197,29 +212,18 @@ def format_offset(minutes_east):
     return f"GMT {sign}{m//60:02d}:{m%60:02d}"
 
 def reverse_geocode(lat, lon, use_cache=True, precision=_GEOCACHE_PRECISION):
-    """
-    Return (display_name, address_dict) by querying Nominatim.
-    If use_cache is True, attempt quick DB/in-memory cache first.
-    """
-    if use_cache:
-        cached = get_geocode_cache_db(lat, lon, precision=precision)
-        if cached:
-            return cached
-
+    cached = get_geocode_cache_db(lat, lon, precision=precision) if use_cache else None
+    if cached:
+        return cached
     try:
         headers = {"User-Agent": f"GeoTagPhotoApp/1.0 ({NOMINATIM_EMAIL})"}
         params = {"format": "jsonv2", "lat": lat, "lon": lon, "zoom": 18, "addressdetails": 1}
-        # small timeout — this is the main latency source; caching avoids repeated calls
-        r = SESSION.get("https://nominatim.openstreetmap.org/reverse", params=params, headers=headers, timeout=4)
+        r = SESSION.get("https://nominatim.openstreetmap.org/reverse", params=params, headers=headers, timeout=5)
         if r.ok:
             j = r.json()
             display = j.get("display_name")
             address = j.get("address", {})
-            # store in cache for later (small DB write)
-            try:
-                set_geocode_cache_db(lat, lon, display or "", address, precision=precision)
-            except Exception:
-                pass
+            set_geocode_cache_db(lat, lon, display or "", address, precision=precision)
             return display, address
     except Exception:
         pass
@@ -233,9 +237,6 @@ def pick_first(address, keys):
     return None
 
 def build_label_lines(lat, lon, tz_offset_min, ts_ms, address_override=None):
-    """
-    Build the label text lines. If address_override provided, use it (dict display_name, address)
-    """
     if address_override:
         display_name, address = address_override
     else:
@@ -283,7 +284,7 @@ def build_label_lines(lat, lon, tz_offset_min, ts_ms, address_override=None):
         "display_name": display_name
     }
 
-# ------------------ canonical signing utilities (self-describing signatures) ------------------
+# ------------------ signing ------------------
 def payload_from_label(lat, lon, tz_offset_min, ts_ms, label_dict):
     tz = timezone(timedelta(minutes=tz_offset_min))
     dt_local = datetime.fromtimestamp(ts_ms/1000.0, tz=tz)
@@ -307,7 +308,6 @@ def canonical_bytes_for_payload(payload: dict) -> bytes:
 
 def sign_payload(payload: dict) -> str:
     data = canonical_bytes_for_payload(payload)
-    # RSA key
     if isinstance(private_key, rsa.RSAPrivateKey):
         sig = private_key.sign(
             data,
@@ -315,16 +315,14 @@ def sign_payload(payload: dict) -> str:
             hashes.SHA256()
         )
         return f"rsa-pss-sha256|{base64.b64encode(sig).decode('ascii')}"
-    # EC key
     try:
         der_sig = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
         return f"ecdsa-p256-sha256|{base64.b64encode(der_sig).decode('ascii')}"
     except Exception as e:
-        raise RuntimeError(f"Unsupported private key type for signing: {e}")
+        raise RuntimeError(f"Unsupported private key: {e}")
 
 def verify_payload_sig(payload: dict, sig_field: str) -> tuple[bool, str]:
     data = canonical_bytes_for_payload(payload)
-    # parse alg|b64
     if isinstance(sig_field, str) and "|" in sig_field:
         alg, b64 = sig_field.split("|", 1)
         try:
@@ -336,7 +334,10 @@ def verify_payload_sig(payload: dict, sig_field: str) -> tuple[bool, str]:
                 public_key.verify(raw, data, ec.ECDSA(hashes.SHA256()))
                 return True, "Signature valid (ECDSA P-256 SHA-256)."
             if alg == "rsa-pss-sha256":
-                public_key.verify(raw, data, asym_padding.PSS(mgf=asym_padding.MGF1(hashes.SHA256()), salt_length=asym_padding.PSS.MAX_LENGTH), hashes.SHA256())
+                public_key.verify(raw, data,
+                                  asym_padding.PSS(mgf=asym_padding.MGF1(hashes.SHA256()),
+                                                   salt_length=asym_padding.PSS.MAX_LENGTH),
+                                  hashes.SHA256())
                 return True, "Signature valid (RSA-PSS SHA-256)."
             if alg == "rsa-pkcs1v15-sha256":
                 public_key.verify(raw, data, asym_padding.PKCS1v15(), hashes.SHA256())
@@ -346,37 +347,28 @@ def verify_payload_sig(payload: dict, sig_field: str) -> tuple[bool, str]:
             return False, "Invalid signature for geo-details."
         except Exception as e:
             return False, f"Verification error: {e}"
-
-    # legacy plain base64: try plausible verifies
+    # legacy attempt(s)
     try:
         raw = base64.b64decode(sig_field)
     except Exception:
         return False, "Malformed base64 signature"
-    # EC try
-    try:
-        public_key.verify(raw, data, ec.ECDSA(hashes.SHA256()))
-        return True, "Signature valid (detected ECDSA legacy)."
-    except Exception:
-        pass
-    # RSA-PSS try
-    try:
-        public_key.verify(raw, data, asym_padding.PSS(mgf=asym_padding.MGF1(hashes.SHA256()), salt_length=asym_padding.PSS.MAX_LENGTH), hashes.SHA256())
-        return True, "Signature valid (detected RSA-PSS legacy)."
-    except Exception:
-        pass
-    # RSA PKCS1v15
-    try:
-        public_key.verify(raw, data, asym_padding.PKCS1v15(), hashes.SHA256())
-        return True, "Signature valid (detected RSA PKCS1v15 legacy)."
-    except InvalidSignature:
-        return False, "Invalid signature for geo-details."
-    except Exception as e:
-        return False, f"Verification error: {e}"
+    for scheme in (
+        lambda: public_key.verify(raw, data, ec.ECDSA(hashes.SHA256())),
+        lambda: public_key.verify(raw, data, asym_padding.PSS(mgf=asym_padding.MGF1(hashes.SHA256()),
+                                                              salt_length=asym_padding.PSS.MAX_LENGTH), hashes.SHA256()),
+        lambda: public_key.verify(raw, data, asym_padding.PKCS1v15(), hashes.SHA256())
+    ):
+        try:
+            scheme()
+            return True, "Signature valid (legacy)."
+        except Exception:
+            pass
+    return False, "Invalid signature for geo-details."
 
-# ------------------ QR helpers (faster compression / smaller QR) ------------------
-_ZLIB_LEVEL = 3            # faster than 9, still compresses
-_QR_BOX_SIZE = 6           # smaller than 10 -> faster
-_QR_BORDER = 2
+# ------------------ QR helpers ------------------
+_ZLIB_LEVEL = 6
+_QR_BOX_SIZE = 10
+_QR_BORDER = 4
 
 def b64url_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
@@ -389,35 +381,31 @@ def make_geosig_qr(sig_object: dict) -> Image.Image:
     js = json.dumps(sig_object, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     packed = zlib.compress(js, level=_ZLIB_LEVEL)
     qr_text = "GSIG1:" + b64url_encode(packed)
-    qr = qrcode.QRCode(version=None, error_correction=ERROR_CORRECT_M, box_size=_QR_BOX_SIZE, border=_QR_BORDER)
+    qr = qrcode.QRCode(version=None, error_correction=ERROR_CORRECT_H, box_size=_QR_BOX_SIZE, border=_QR_BORDER)
     qr.add_data(qr_text)
     qr.make(fit=True)
     return qr.make_image(fill_color="black", back_color="white").convert("RGBA")
 
-# ------------------ font caching ------------------
+# ------------------ font cache ------------------
 _FONT_CACHE = {}
 def get_font(size):
-    # try common locations and cache by size
-    key = size
-    if key in _FONT_CACHE:
-        return _FONT_CACHE[key]
-    font_paths = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                  "/Library/Fonts/Arial.ttf",
-                  "C:\\Windows\\Fonts\\arial.ttf"]
-    f = None
-    for path in font_paths:
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    for path in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                 "/Library/Fonts/Arial.ttf",
+                 "C:\\Windows\\Fonts\\arial.ttf"]:
         if os.path.exists(path):
             try:
                 f = ImageFont.truetype(path, size)
-                break
+                _FONT_CACHE[size] = f
+                return f
             except Exception:
                 pass
-    if f is None:
-        f = ImageFont.load_default()
-    _FONT_CACHE[key] = f
+    f = ImageFont.load_default()
+    _FONT_CACHE[size] = f
     return f
 
-# ------------------ render bottom strip (re-usable and deterministic) ------------------
+# ------------------ strip rendering ------------------
 def build_lines_from_payload(payload: dict) -> dict:
     title = payload.get("title", "")
     detail = payload.get("detail", "")
@@ -443,16 +431,17 @@ def render_strip_from_sigobject(sig_object: dict, width: int) -> Image.Image:
     payload = sig_object.get("payload", {})
     lines = build_lines_from_payload(payload)
     W = width
-    title_font_size = max(12, int(W * 0.028))
-    body_font_size  = max(10, int(W * 0.018))
+    title_font_size = max(14, int(W * 0.030))
+    body_font_size  = max(12, int(W * 0.020))
     font_title = get_font(title_font_size)
     font_body  = get_font(body_font_size)
 
     pad_x = int(W * 0.02)
-    pad_y = max(6, int(W * 0.012))
+    pad_y = max(8, int(W * 0.012))
     gap   = int(W * 0.006)
 
-    qr_side = max(120, min(180, int(W * 0.14)))
+    # Larger QR to survive mobile recompression
+    qr_side = max(220, min(260, int(W * 0.17)))
     qr_img = make_geosig_qr(sig_object).resize((qr_side, qr_side), Image.NEAREST)
 
     text_w = W - (qr_side + 3*pad_x)
@@ -468,11 +457,9 @@ def render_strip_from_sigobject(sig_object: dict, width: int) -> Image.Image:
             if (bbox[2]-bbox[0]) <= max_w:
                 line = t
             else:
-                if line:
-                    out.append(line)
+                if line: out.append(line)
                 line = w
-        if line:
-            out.append(line)
+        if line: out.append(line)
         return out
 
     title_lines  = wrap(draw_dummy, lines.get("title_line",""),  font_title, text_w)
@@ -491,7 +478,7 @@ def render_strip_from_sigobject(sig_object: dict, width: int) -> Image.Image:
                     len(time_lines)*body_h + pad_y)
 
     strip_h = max(qr_side + 2*pad_y, text_block_h)
-    strip_h = max(strip_h, 120)
+    strip_h = max(strip_h, 140)
     strip_h = min(strip_h, int((W/16)*9))
 
     strip = Image.new("RGBA", (W, strip_h), (255,255,255,255))
@@ -506,47 +493,41 @@ def render_strip_from_sigobject(sig_object: dict, width: int) -> Image.Image:
     black = (20,20,20)
     gray = (80,80,80)
     for ln in title_lines:
-        draw.text((tx, ty), ln, font=font_title, fill=black)
-        ty += title_h
+        draw.text((tx, ty), ln, font=font_title, fill=black); ty += title_h
     ty += gap
     for ln in detail_lines:
-        draw.text((tx, ty), ln, font=font_body, fill=gray)
-        ty += body_h
+        draw.text((tx, ty), ln, font=font_body, fill=gray); ty += body_h
     ty += gap
     for ln in latlon_lines:
-        draw.text((tx, ty), ln, font=font_body, fill=gray)
-        ty += body_h
+        draw.text((tx, ty), ln, font=font_body, fill=gray); ty += body_h
     ty += gap
     for ln in time_lines:
-        draw.text((tx, ty), ln, font=font_body, fill=gray)
-        ty += body_h
+        draw.text((tx, ty), ln, font=font_body, fill=gray); ty += body_h
 
     draw.text((qr_x, qr_y + qr_side + 4), f"Sig {KID}", font=font_body, fill=(120,120,120))
     return strip.convert("RGB")
 
-# ------------------ full-image composition ------------------
-def draw_bottom_strip(img: Image.Image, lines: dict, sig_object: dict) -> Image.Image:
+def draw_bottom_strip(img: Image.Image, sig_object: dict) -> Image.Image:
     strip = render_strip_from_sigobject(sig_object, img.width)
     W, H = img.size
-    strip_w, strip_h = strip.size
-    out = Image.new("RGB", (W, H + strip_h), (255,255,255))
+    out = Image.new("RGB", (W, H + strip.height), (255,255,255))
     out.paste(img, (0,0))
     out.paste(strip, (0, H))
     draw = ImageDraw.Draw(out)
     draw.rectangle([(0,H), (W, H+1)], fill=(220,220,220))
     return out
 
-# ------------------ pHash utilities (faster: resize 16 -> lower CPU) ------------------
-_PHASH_RESIZE = 16  # previously 32; 16 speeds DCT substantially but still uses 8x8 block
-def phash_pil(img: Image.Image) -> str:
+# ------------------ perceptual hashes ------------------
+_PHASH_RESIZE = 16
+
+def phash(img: Image.Image) -> str:
     size = _PHASH_RESIZE
-    small = 8
     gray = np.array(img.convert("L"), dtype=np.float32)
     if gray.size == 0:
         return "0"*16
     resized = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
     dct = cv2.dct(resized)
-    block = dct[:small, :small]
+    block = dct[:8, :8]
     med = np.median(block.flatten())
     bits = (block.flatten() > med).astype(np.uint8)
     val = 0
@@ -554,15 +535,45 @@ def phash_pil(img: Image.Image) -> str:
         val = (val << 1) | int(b)
     return "{:016x}".format(val)
 
+def ahash(img: Image.Image) -> str:
+    gray = np.array(img.convert("L").resize((8,8), Image.BILINEAR), dtype=np.float32)
+    avg = gray.mean()
+    bits = (gray >= avg).astype(np.uint8).flatten()
+    val = 0
+    for b in bits:
+        val = (val << 1) | int(b)
+    return "{:016x}".format(val)
+
+def dhash(img: Image.Image) -> str:
+    gray = np.array(img.convert("L").resize((9,8), Image.BILINEAR), dtype=np.float32)
+    diff = gray[:,1:] > gray[:,:-1]
+    bits = diff.astype(np.uint8).flatten()
+    val = 0
+    for b in bits:
+        val = (val << 1) | int(b)
+    return "{:016x}".format(val)
+
 def hamming_hex(a_hex: str, b_hex: str) -> int:
     try:
-        a = int(a_hex, 16)
-        b = int(b_hex, 16)
+        a = int(a_hex or "0", 16)
+        b = int(b_hex or "0", 16)
         return (a ^ b).bit_count()
     except Exception:
         return 999
 
-# ------------------ QR decode (robust) / EXIF extraction ------------------
+def compute_hashes_for(img: Image.Image):
+    w, h = img.size
+    top_crop = img.crop((0, 0, w, int(h * 0.80)))
+    return {
+        "ph_full": phash(img),
+        "ph_top": phash(top_crop),
+        "ah_full": ahash(img),
+        "ah_top": ahash(top_crop),
+        "dh_full": dhash(img),
+        "dh_top": dhash(top_crop)
+    }
+
+# ------------------ QR/EXIF decode ------------------
 def decode_geosig_from_qr(raw_bytes: bytes):
     np_arr = np.frombuffer(raw_bytes, np.uint8)
     img_color = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -571,12 +582,14 @@ def decode_geosig_from_qr(raw_bytes: bytes):
     detector = cv2.QRCodeDetector()
     candidates = []
 
-    def try_decode(img_gray):
-        data, pts, _ = detector.detectAndDecode(img_gray)
+    def try_decode_img(img):
+        # Single
+        data, pts, _ = detector.detectAndDecode(img)
         if data:
             candidates.append(data)
+        # Multi
         try:
-            retval, decoded_info, points, _ = detector.detectAndDecodeMulti(img_gray)
+            retval, decoded_info, points, _ = detector.detectAndDecodeMulti(img)
             if retval and decoded_info:
                 for d in decoded_info:
                     if d:
@@ -585,7 +598,11 @@ def decode_geosig_from_qr(raw_bytes: bytes):
             pass
 
     gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
-    variations = [gray]
+    H, W = gray.shape[:2]
+    variations = []
+
+    # base + processed variants
+    variations.append(gray)
     try:
         thr = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,2)
         variations.append(thr)
@@ -596,16 +613,33 @@ def decode_geosig_from_qr(raw_bytes: bytes):
         variations.append(otsu)
     except Exception:
         pass
+    try:
+        blurred = cv2.GaussianBlur(gray, (3,3), 0)
+        variations.append(blurred)
+    except Exception:
+        pass
+    try:
+        med = cv2.medianBlur(gray, 3)
+        variations.append(med)
+    except Exception:
+        pass
 
-    scales = [1.0, 1.5, 2.0, 0.75]
+    # also try likely strip region(s) near bottom
+    bands = [(int(H*0.55), H), (int(H*0.65), H), (int(H*0.75), H)]
+    for y0, y1 in bands:
+        crop = gray[y0:y1, :]
+        if crop.size > 0:
+            variations.append(crop)
+
+    scales = [0.6, 0.8, 1.0, 1.25, 1.5, 2.0]
     for img in variations:
         for s in scales:
             if s != 1.0:
                 h, w = img.shape[:2]
-                img_s = cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_LINEAR)
+                img_s = cv2.resize(img, (max(32, int(w*s)), max(32, int(h*s))), interpolation=cv2.INTER_LINEAR)
             else:
                 img_s = img
-            try_decode(img_s)
+            try_decode_img(img_s)
 
     for s in candidates:
         try:
@@ -635,39 +669,87 @@ def extract_geosig_from_exif(raw_bytes: bytes):
     return None
 
 # ------------------ DB helpers ------------------
-def store_capture_record(filename: str, phash_hex: str, strip_phash: str, payload: dict, signature_b64: str):
+def store_capture_record(filename: str, hashes: dict, strip_phash: str, payload: dict, signature_b64: str):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute("INSERT INTO images (filename, phash, strip_phash, payload, signature, ts) VALUES (?, ?, ?, ?, ?, ?)",
-                (filename, phash_hex, strip_phash, json.dumps(payload, separators=(",", ":")), signature_b64, datetime.utcnow().isoformat()))
+    cur.execute("""
+        INSERT INTO images
+            (filename, phash, strip_phash, payload, signature, ts,
+             photo_phash_top, ahash_full, ahash_top, dhash_full, dhash_top)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        filename,
+        hashes.get("ph_full"),
+        strip_phash,
+        json.dumps(payload, separators=(",", ":")),
+        signature_b64,
+        datetime.utcnow().isoformat(),
+        hashes.get("ph_top"),
+        hashes.get("ah_full"),
+        hashes.get("ah_top"),
+        hashes.get("dh_full"),
+        hashes.get("dh_top"),
+    ))
     con.commit()
     con.close()
 
-def find_best_phash_match(phash_hex: str, max_hamming=10):
+def find_best_hash_match(hashes: dict):
+    """Return best candidate row using combined hash distances and adaptive thresholds."""
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-    cur.execute("SELECT id, filename, phash, strip_phash, payload, signature, ts FROM images")
+    cur.execute("SELECT id, filename, phash, strip_phash, payload, signature, ts, photo_phash_top, ahash_full, ahash_top, dhash_full, dhash_top FROM images")
     rows = cur.fetchall()
     con.close()
+
+    if not rows:
+        return None
+
+    # Thresholds tuned for social-media recompression/resizing
+    PH_TIGHT = 12    # excellent match
+    PH_LOOSE = 20    # good enough after heavy compression
+    AD_THR   = 18    # for aHash/dHash
+
     best = None
-    best_dist = 999
+    best_score = (999, 999, 999)  # (primary, secondary, tertiary)
+
     for r in rows:
-        try:
-            dist = hamming_hex(phash_hex, r[2])
-        except Exception:
+        id_, filename, ph_full_db, strip_ph, payload_json, sig, ts, ph_top_db, ah_full_db, ah_top_db, dh_full_db, dh_top_db = r
+        # compute distances
+        d_ph_full = hamming_hex(hashes["ph_full"], ph_full_db or "")
+        d_ph_top  = hamming_hex(hashes["ph_top"],  ph_top_db  or "")
+        d_ah_full = hamming_hex(hashes["ah_full"], ah_full_db or "")
+        d_ah_top  = hamming_hex(hashes["ah_top"],  ah_top_db  or "")
+        d_dh_full = hamming_hex(hashes["dh_full"], dh_full_db or "")
+        d_dh_top  = hamming_hex(hashes["dh_top"],  dh_top_db  or "")
+
+        ph_best = min(d_ph_full, d_ph_top)
+        ah_best = min(d_ah_full, d_ah_top)
+        dh_best = min(d_dh_full, d_dh_top)
+
+        # quick accept window
+        acceptable = (
+            ph_best <= PH_TIGHT or
+            (ph_best <= PH_LOOSE and (ah_best <= AD_THR or dh_best <= AD_THR))
+        )
+        if not acceptable:
             continue
-        if dist < best_dist:
-            best_dist = dist
-            best = r
-    if best and best_dist <= max_hamming:
-        id_, filename, phash, strip_phash, payload_json, signature_b64, ts = best
-        try:
-            payload = json.loads(payload_json)
-        except Exception:
-            payload = None
-        return {"id": id_, "filename": filename, "phash": phash, "strip_phash": strip_phash,
-                "payload": payload, "signature": signature_b64, "dist": best_dist}
-    return None
+
+        score = (ph_best, ah_best, dh_best)
+        if score < best_score:
+            best_score = score
+            try:
+                payload = json.loads(payload_json)
+            except Exception:
+                payload = None
+            best = {
+                "id": id_,
+                "filename": filename,
+                "payload": payload,
+                "signature": sig,
+                "score": score
+            }
+
+    return best
 
 # ------------------ ROUTES ------------------
 @app.get("/")
@@ -676,7 +758,6 @@ def index():
 
 @app.post("/capture")
 def capture():
-    # Expect: photo file, lat, lon, tz_offset_min, ts_ms
     if "photo" not in request.files:
         return jsonify({"error":"No photo uploaded"}), 400
     photo = request.files["photo"]
@@ -688,53 +769,40 @@ def capture():
     except Exception as e:
         return jsonify({"error": f"Bad form data: {e}"}), 400
 
-    # Start geocoding in a background thread so we overlap I/O with CPU work
+    # reverse geocode in background
     geocode_result = {}
     def _geocode_worker():
         display, addr = reverse_geocode(lat, lon, use_cache=True, precision=_GEOCACHE_PRECISION)
         geocode_result['display'] = display
         geocode_result['addr'] = addr
-
     t = threading.Thread(target=_geocode_worker, daemon=True)
     t.start()
 
-    # Load image and compute main pHash immediately (CPU-bound) while geocode runs
+    # original photo
     img = Image.open(photo.stream).convert("RGB")
-    ph = phash_pil(img)
+    hashes = compute_hashes_for(img)
 
-    # Wait for geocode thread to finish but we allow a short max wait (to avoid indefinite block).
-    # Usually Nominatim responds quickly; in worst case we wait a small extra time to allow QR/strip generation
-    t.join(timeout=4.0)  # join but don't block forever; caching helps repeated captures
-
-    # Build label lines (use geocode results if available)
-    address_override = None
-    if 'display' in geocode_result:
-        address_override = (geocode_result.get('display'), geocode_result.get('addr') or {})
+    t.join(timeout=5.0)
+    address_override = (geocode_result.get('display'), geocode_result.get('addr') or {}) if 'display' in geocode_result else (get_geocode_cache_db(lat, lon) or reverse_geocode(lat, lon, use_cache=True))
+    if isinstance(address_override, tuple):
+        label = build_label_lines(lat, lon, tz_offset_min, ts_ms, address_override=address_override)
     else:
-        # fallback: try a quick cached lookup without network (very fast)
-        c = get_geocode_cache_db(lat, lon)
-        if c:
-            address_override = c
-        else:
-            # as a last resort, do a synchronous geocode with a short timeout (rare)
-            display, addr = reverse_geocode(lat, lon, use_cache=True, precision=_GEOCACHE_PRECISION)
-            address_override = (display, addr)
+        label = build_label_lines(lat, lon, tz_offset_min, ts_ms)
 
-    label = build_label_lines(lat, lon, tz_offset_min, ts_ms, address_override=address_override)
     payload = payload_from_label(lat, lon, tz_offset_min, ts_ms, label)
-    sig_b64 = sign_payload(payload)
-    sig_object = {"v": 1, "kid": KID, "payload": payload, "sig": sig_b64}
+    sig_field = sign_payload(payload)
+    sig_object = {"v": 1, "kid": KID, "payload": payload, "sig": sig_field}
 
-    # render strip + compute strip phash (these are relatively fast now)
+    # strip and composite
     strip_img = render_strip_from_sigobject(sig_object, img.width)
-    strip_ph = phash_pil(strip_img)
-
-    # compose final image with bottom strip
+    strip_ph = phash(strip_img)
     final_img = Image.new("RGB", (img.width, img.height + strip_img.height), (255,255,255))
     final_img.paste(img, (0,0))
     final_img.paste(strip_img, (0, img.height))
+    draw = ImageDraw.Draw(final_img)
+    draw.rectangle([(0,img.height), (img.width, img.height+1)], fill=(220,220,220))
 
-    # EXIF embedding (same as before)
+    # EXIF (will be stripped by social apps, but preserved for direct downloads)
     tz = timezone(timedelta(minutes=tz_offset_min))
     dt_local = datetime.fromtimestamp(ts_ms/1000.0, tz=tz)
     exif_local_str = dt_local.strftime("%Y:%m:%d %H:%M:%S")
@@ -746,22 +814,26 @@ def capture():
     exif_dict["Exif"][piexif.ExifIFD.UserComment] = UserComment.dump(label["single_line"], encoding="unicode")
     exif_dict["0th"][piexif.ImageIFD.ImageDescription] = json.dumps({"GEOSIG": sig_object}, separators=(",", ":")).encode("utf-8", errors="ignore")
 
-    # Save final image (lowered JPEG quality for speed + smaller file)
     safe_ts = dt_local.strftime("%Y%m%d_%H%M%S")
     filename = f"geotag_{safe_ts}.jpg"
     out_path = os.path.join(OUTPUT_DIR, filename)
     bio = io.BytesIO()
     exif_bytes = piexif.dump(exif_dict)
-    # quality=85 is a good speed/size tradeoff; optimize=False to avoid extra processing
-    final_img.save(bio, format="JPEG", quality=85, exif=exif_bytes, optimize=False)
+    # modest quality keeps QR robust after re-compression
+    final_img.save(bio, format="JPEG", quality=88, exif=exif_bytes, optimize=False)
     with open(out_path, "wb") as f:
         f.write(bio.getvalue())
 
-    # store DB mapping phash -> payload + signature + strip_phash
-    store_capture_record(filename, ph, strip_ph, payload, sig_b64)
+    store_capture_record(filename, hashes, strip_ph, payload, sig_field)
 
-    file_url = url_for("static", filename=f"outputs/{filename}", _external=True)
-    return jsonify({"ok": True, "file": file_url, "label_lines": label, "kid": KID})
+    view_url = url_for("view_image", filename=filename, _external=True)
+    download_url = url_for("download", filename=filename, _external=True)
+    return jsonify({"ok": True,
+                    "file": view_url,          # preview
+                    "view_url": view_url,
+                    "download_url": download_url,
+                    "label_lines": label,
+                    "kid": KID})
 
 @app.post("/verify")
 def verify():
@@ -769,20 +841,20 @@ def verify():
         return jsonify({"error":"No file uploaded"}), 400
     raw = request.files["file"].read()
 
+    # 1) Try EXIF
     sigobj = extract_geosig_from_exif(raw)
-    source = None
-    if sigobj:
-        source = "exif"
-    else:
+
+    # 2) Try QR (robust decoder)
+    if not sigobj:
         sigobj = decode_geosig_from_qr(raw)
-        if sigobj:
-            source = "qr"
 
     if sigobj:
         payload = sigobj.get("payload")
         sig_field = sigobj.get("sig")
         if isinstance(payload, dict) and isinstance(sig_field, str):
             valid, vmsg = verify_payload_sig(payload, sig_field)
+
+            # details to return on success
             details = {
                 "title": payload.get("title",""),
                 "detail": payload.get("detail",""),
@@ -793,62 +865,59 @@ def verify():
                 "plus": payload.get("plus"),
                 "kid": payload.get("kid")
             }
+
+            # Check visible label vs signed payload (detect edited text)
             try:
                 img = Image.open(io.BytesIO(raw)).convert("RGB")
                 W, H = img.size
                 expected_strip = render_strip_from_sigobject(sigobj, W)
-                strip_h = expected_strip.height
-                if strip_h >= H:
+                sh = expected_strip.height
+                if sh < H:
+                    crop = img.crop((0, H - sh, W, H))
+                    dist = hamming_hex(phash(expected_strip), phash(crop))
+                    overlay_match = dist <= 10
+                    overlay_dist = dist
+                else:
                     overlay_match = False
                     overlay_dist = None
-                else:
-                    crop = img.crop((0, H - strip_h, W, H))
-                    expected_ph = phash_pil(expected_strip)
-                    actual_ph = phash_pil(crop)
-                    overlay_dist = hamming_hex(expected_ph, actual_ph)
-                    OVERLAY_THRESHOLD = 8
-                    overlay_match = (overlay_dist <= OVERLAY_THRESHOLD)
             except Exception:
                 overlay_match = False
                 overlay_dist = None
 
             if valid:
                 if overlay_match:
-                    return jsonify({"ok": True, "verifiable": True, "valid": True,
-                                    "message": f"VALID — ORIGINAL — {vmsg}",
-                                    "overlay_match": True, "overlay_hamming": overlay_dist,
-                                    "details": details}), 200
+                    return jsonify({
+                        "ok": True, "verifiable": True, "valid": True,
+                        "message": f"VALID — ORIGINAL — {vmsg}",
+                        "overlay_match": True, "overlay_hamming": overlay_dist,
+                        "details": details
+                    }), 200
                 else:
-                    return jsonify({"ok": True, "verifiable": True, "valid": False,
-                                    "message": f"TAMPERED — Signature valid but visible label does not match signed payload. {vmsg}",
-                                    "overlay_match": False, "overlay_hamming": overlay_dist,
-                                    "details_signed": details}), 200
+                    return jsonify({
+                        "ok": True, "verifiable": True, "valid": False,
+                        "message": f"TAMPERED — Signature valid but visible label does not match signed payload. {vmsg}",
+                        "overlay_match": False, "overlay_hamming": overlay_dist,
+                        "details_signed": details
+                    }), 200
             else:
                 return jsonify({"ok": True, "verifiable": True, "valid": False,
                                 "message": "TAMPERED — " + vmsg}), 200
 
-    # DB fallback (phash)
+    # 3) Perceptual-hash DB fallback (survives EXIF strip, QR blur/crop)
     try:
         img = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as e:
         return jsonify({"error": f"Invalid image: {e}"}), 400
 
-    full_ph = phash_pil(img)
-    w, h = img.size
-    crop_h = int(h * 0.80)
-    top_crop = img.crop((0, 0, w, crop_h))
-    crop_ph = phash_pil(top_crop)
-
-    MAX_DIST = 10
-    candidate = find_best_phash_match(full_ph, max_hamming=MAX_DIST)
-    if not candidate:
-        candidate = find_best_phash_match(crop_ph, max_hamming=MAX_DIST)
+    hashes_in = compute_hashes_for(img)
+    candidate = find_best_hash_match(hashes_in)
 
     if candidate:
         payload = candidate.get("payload")
         sig_field = candidate.get("signature")
         if isinstance(payload, dict) and isinstance(sig_field, str):
             valid, vmsg = verify_payload_sig(payload, sig_field)
+
             details = {
                 "title": payload.get("title",""),
                 "detail": payload.get("detail",""),
@@ -859,42 +928,77 @@ def verify():
                 "plus": payload.get("plus"),
                 "kid": payload.get("kid")
             }
+
+            # Try label match too (if bottom strip exists)
             try:
-                expected_strip = render_strip_from_sigobject({"payload": payload, "sig": sig_field}, img.width)
-                strip_h = expected_strip.height
-                if strip_h >= img.height:
+                W, H = img.size
+                expected_strip = render_strip_from_sigobject({"payload": payload, "sig": sig_field}, W)
+                sh = expected_strip.height
+                if sh < H:
+                    crop = img.crop((0, H - sh, W, H))
+                    dist = hamming_hex(phash(expected_strip), phash(crop))
+                    overlay_match = dist <= 10
+                    overlay_dist = dist
+                else:
                     overlay_match = False
                     overlay_dist = None
-                else:
-                    crop = img.crop((0, img.height - strip_h, img.width, img.height))
-                    overlay_dist = hamming_hex(phash_pil(expected_strip), phash_pil(crop))
-                    OVERLAY_THRESHOLD = 8
-                    overlay_match = (overlay_dist <= OVERLAY_THRESHOLD)
             except Exception:
                 overlay_match = False
                 overlay_dist = None
 
             if valid:
                 if overlay_match:
-                    return jsonify({"ok": True, "verifiable": True, "valid": True,
-                                    "message": f"VALID — ORIGINAL — {vmsg} (matched DB entry id {candidate.get('id')})",
-                                    "overlay_match": True, "overlay_hamming": overlay_dist,
-                                    "details": details}), 200
+                    return jsonify({
+                        "ok": True, "verifiable": True, "valid": True,
+                        "message": f"VALID — ORIGINAL — {vmsg} (matched DB entry id {candidate.get('id')})",
+                        "overlay_match": True, "overlay_hamming": overlay_dist,
+                        "details": details
+                    }), 200
                 else:
-                    return jsonify({"ok": True, "verifiable": True, "valid": False,
-                                    "message": f"TAMPERED — Stored signature valid but visible label mismatch (phash dist {overlay_dist}).",
-                                    "overlay_match": False, "overlay_hamming": overlay_dist,
-                                    "details_signed": details}), 200
+                    # Still mark valid? We choose to flag as tampered-visible-label to detect edits.
+                    return jsonify({
+                        "ok": True, "verifiable": True, "valid": False,
+                        "message": f"TAMPERED — Stored signature valid but visible label mismatch.",
+                        "overlay_match": False, "overlay_hamming": overlay_dist,
+                        "details_signed": details
+                    }), 200
             else:
                 return jsonify({"ok": True, "verifiable": True, "valid": False,
                                 "message": "TAMPERED — Stored signature invalid."}), 200
 
+    # 4) Nothing matched
     return jsonify({"ok": True, "verifiable": False, "valid": False,
                     "message": "UNVERIFIABLE — No GeoSig found and no perceptual match in local store."}), 200
 
-@app.get("/download/<path:filename>")
+# ---------- view (inline) ----------
+@app.get("/view/<path:filename>")
+def view_image(filename):
+    safe = secure_filename(os.path.basename(filename))
+    path = os.path.join(OUTPUT_DIR, safe)
+    if not os.path.isfile(path):
+        return jsonify({"error": "File not found"}), 404
+    resp = send_from_directory(OUTPUT_DIR, safe, as_attachment=False, mimetype="image/jpeg")
+    resp.headers["Content-Disposition"] = f'inline; filename="{safe}"'
+    return resp
+
+# ---------- download (force save) ----------
+@app.route("/download/<path:filename>", methods=["GET", "HEAD"])
 def download(filename):
-    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
+    safe = secure_filename(os.path.basename(filename))
+    path = os.path.join(OUTPUT_DIR, safe)
+    if not os.path.isfile(path):
+        return jsonify({"error": "File not found"}), 404
+    resp = send_from_directory(
+        OUTPUT_DIR,
+        safe,
+        as_attachment=True,
+        download_name=safe,
+        mimetype="application/octet-stream"
+    )
+    resp.headers["Content-Disposition"] = f'attachment; filename="{safe}"'
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "private, max-age=600"
+    return resp
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
